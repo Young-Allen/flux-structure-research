@@ -197,9 +197,7 @@ class FluxPipeline(
         self.vae_scale_factor = (
             2 ** (len(self.vae.config.block_out_channels) - 1) if hasattr(self, "vae") and self.vae is not None else 8
         )
-        # Flux latents are turned into 2x2 patches and packed. This means the latent width and height has to be divisible
-        # by the patch size. So the vae scale factor is multiplied by the patch size to account for this
-        self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor * 2)
+        self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor)
         self.tokenizer_max_length = (
             self.tokenizer.model_max_length if hasattr(self, "tokenizer") and self.tokenizer is not None else 77
         )
@@ -388,9 +386,9 @@ class FluxPipeline(
         callback_on_step_end_tensor_inputs=None,
         max_sequence_length=None,
     ):
-        if height % (self.vae_scale_factor * 2) != 0 or width % (self.vae_scale_factor * 2) != 0:
-            logger.warning(
-                f"`height` and `width` have to be divisible by {self.vae_scale_factor * 2} but are {height} and {width}. Dimensions will be resized accordingly"
+        if height % self.vae_scale_factor != 0 or width % self.vae_scale_factor != 0:
+            raise ValueError(
+                f"`height` and `width` have to be divisible by {self.vae_scale_factor} but are {height} and {width}."
             )
 
         if callback_on_step_end_tensor_inputs is not None and not all(
@@ -453,10 +451,8 @@ class FluxPipeline(
     def _unpack_latents(latents, height, width, vae_scale_factor):
         batch_size, num_patches, channels = latents.shape
 
-        # VAE applies 8x compression on images but we must also account for packing which requires
-        # latent height and width to be divisible by 2.
-        height = 2 * (int(height) // (vae_scale_factor * 2))
-        width = 2 * (int(width) // (vae_scale_factor * 2))
+        height = height // vae_scale_factor
+        width = width // vae_scale_factor
 
         latents = latents.view(batch_size, height // 2, width // 2, channels // 4, 2, 2)
         latents = latents.permute(0, 3, 1, 4, 2, 5)
@@ -505,15 +501,13 @@ class FluxPipeline(
         generator,
         latents=None,
     ):
-        # VAE applies 8x compression on images but we must also account for packing which requires
-        # latent height and width to be divisible by 2.
-        height = 2 * (int(height) // (self.vae_scale_factor * 2))
-        width = 2 * (int(width) // (self.vae_scale_factor * 2))
+        height = int(height) // self.vae_scale_factor
+        width = int(width) // self.vae_scale_factor
 
         shape = (batch_size, num_channels_latents, height, width)
 
         if latents is not None:
-            latent_image_ids = self._prepare_latent_image_ids(batch_size, height // 2, width // 2, device, dtype)
+            latent_image_ids = self._prepare_latent_image_ids(batch_size, height, width, device, dtype)
             return latents.to(device=device, dtype=dtype), latent_image_ids
 
         if isinstance(generator, list) and len(generator) != batch_size:
@@ -554,7 +548,7 @@ class FluxPipeline(
         height: Optional[int] = None,
         width: Optional[int] = None,
         num_inference_steps: int = 28,
-        sigmas: Optional[List[float]] = None,
+        timesteps: List[int] = None,
         guidance_scale: float = 3.5,
         num_images_per_prompt: Optional[int] = 1,
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
@@ -567,6 +561,9 @@ class FluxPipeline(
         callback_on_step_end: Optional[Callable[[int, int, Dict], None]] = None,
         callback_on_step_end_tensor_inputs: List[str] = ["latents"],
         max_sequence_length: int = 512,
+        new_text_embedding: Optional[Any] = None,
+        original_text_embedding: Optional[Any] = None,
+        change_block: Optional[int] = None
     ):
         r"""
         Function invoked when calling the pipeline for generation.
@@ -585,10 +582,10 @@ class FluxPipeline(
             num_inference_steps (`int`, *optional*, defaults to 50):
                 The number of denoising steps. More denoising steps usually lead to a higher quality image at the
                 expense of slower inference.
-            sigmas (`List[float]`, *optional*):
-                Custom sigmas to use for the denoising process with schedulers which support a `sigmas` argument in
-                their `set_timesteps` method. If not defined, the default behavior when `num_inference_steps` is passed
-                will be used.
+            timesteps (`List[int]`, *optional*):
+                Custom timesteps to use for the denoising process with schedulers which support a `timesteps` argument
+                in their `set_timesteps` method. If not defined, the default behavior when `num_inference_steps` is
+                passed will be used. Must be in descending order.
             guidance_scale (`float`, *optional*, defaults to 7.0):
                 Guidance scale as defined in [Classifier-Free Diffusion Guidance](https://arxiv.org/abs/2207.12598).
                 `guidance_scale` is defined as `w` of equation 2. of [Imagen
@@ -699,7 +696,7 @@ class FluxPipeline(
         )
 
         # 5. Prepare timesteps
-        sigmas = np.linspace(1.0, 1 / num_inference_steps, num_inference_steps) if sigmas is None else sigmas
+        sigmas = np.linspace(1.0, 1 / num_inference_steps, num_inference_steps)
         image_seq_len = latents.shape[1]
         mu = calculate_shift(
             image_seq_len,
@@ -712,7 +709,8 @@ class FluxPipeline(
             self.scheduler,
             num_inference_steps,
             device,
-            sigmas=sigmas,
+            timesteps,
+            sigmas,
             mu=mu,
         )
         num_warmup_steps = max(len(timesteps) - num_inference_steps * self.scheduler.order, 0)
@@ -725,6 +723,7 @@ class FluxPipeline(
         else:
             guidance = None
 
+        embedding_changes = []
         # 6. Denoising loop
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
@@ -733,7 +732,7 @@ class FluxPipeline(
 
                 # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
                 timestep = t.expand(latents.shape[0]).to(latents.dtype)
-
+                # predict the noise residual
                 noise_pred = self.transformer(
                     hidden_states=latents,
                     timestep=timestep / 1000,
@@ -744,7 +743,13 @@ class FluxPipeline(
                     img_ids=latent_image_ids,
                     joint_attention_kwargs=self.joint_attention_kwargs,
                     return_dict=False,
-                )[0]
+                    num_inference_steps=i,
+                    new_text_embedding=new_text_embedding,
+                    original_text_embedding=original_text_embedding,
+                    change_block=change_block,
+                )
+                embedding_changes.append(noise_pred[1])
+                noise_pred = noise_pred[0]
 
                 # compute the previous noisy sample x_t -> x_t-1
                 latents_dtype = latents.dtype
@@ -784,6 +789,7 @@ class FluxPipeline(
         self.maybe_free_model_hooks()
 
         if not return_dict:
-            return (image,)
+            return image,embedding_changes
 
-        return FluxPipelineOutput(images=image)
+        return FluxPipelineOutput(images=image, embedding_changes=embedding_changes)
+

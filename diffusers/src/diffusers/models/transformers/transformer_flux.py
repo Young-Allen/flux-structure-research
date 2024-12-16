@@ -13,7 +13,7 @@
 # limitations under the License.
 
 
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Dict, Optional, Tuple, Union, List
 
 import numpy as np
 import torch
@@ -238,7 +238,6 @@ class FluxTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrig
         self,
         patch_size: int = 1,
         in_channels: int = 64,
-        out_channels: Optional[int] = None,
         num_layers: int = 19,
         num_single_layers: int = 38,
         attention_head_dim: int = 128,
@@ -249,7 +248,7 @@ class FluxTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrig
         axes_dims_rope: Tuple[int] = (16, 56, 56),
     ):
         super().__init__()
-        self.out_channels = out_channels or in_channels
+        self.out_channels = in_channels
         self.inner_dim = self.config.num_attention_heads * self.config.attention_head_dim
 
         self.pos_embed = FluxPosEmbed(theta=10000, axes_dim=axes_dims_rope)
@@ -262,7 +261,7 @@ class FluxTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrig
         )
 
         self.context_embedder = nn.Linear(self.config.joint_attention_dim, self.inner_dim)
-        self.x_embedder = nn.Linear(self.config.in_channels, self.inner_dim)
+        self.x_embedder = torch.nn.Linear(self.config.in_channels, self.inner_dim)
 
         self.transformer_blocks = nn.ModuleList(
             [
@@ -409,7 +408,11 @@ class FluxTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrig
         controlnet_single_block_samples=None,
         return_dict: bool = True,
         controlnet_blocks_repeat: bool = False,
-    ) -> Union[torch.FloatTensor, Transformer2DModelOutput]:
+        num_inference_steps: Optional[int] = None,
+        new_text_embedding: Optional[Any] = None,
+        original_text_embedding: Optional[Any] = None,
+        change_block: Optional[int] = None
+    ) -> tuple[Any, list[Any]] | Transformer2DModelOutput:
         """
         The [`FluxTransformer2DModel`] forward method.
 
@@ -450,7 +453,6 @@ class FluxTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrig
                 logger.warning(
                     "Passing `scale` via `joint_attention_kwargs` when not using the PEFT backend is ineffective."
                 )
-
         hidden_states = self.x_embedder(hidden_states)
 
         timestep = timestep.to(hidden_states.dtype) * 1000
@@ -458,7 +460,6 @@ class FluxTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrig
             guidance = guidance.to(hidden_states.dtype) * 1000
         else:
             guidance = None
-
         temb = (
             self.time_text_embed(timestep, pooled_projections)
             if guidance is None
@@ -482,36 +483,25 @@ class FluxTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrig
         ids = torch.cat((txt_ids, img_ids), dim=0)
         image_rotary_emb = self.pos_embed(ids)
 
+        temp_embedding = []
+        temp_embedding.append(encoder_hidden_states)
         for index_block, block in enumerate(self.transformer_blocks):
-            if torch.is_grad_enabled() and self.gradient_checkpointing:
+            # the blocks that we want to replace with a new text_embeddin
+            if change_block != -1:
+                encoder_hidden_states = original_text_embedding[num_inference_steps][index_block]
 
-                def create_custom_forward(module, return_dict=None):
-                    def custom_forward(*inputs):
-                        if return_dict is not None:
-                            return module(*inputs, return_dict=return_dict)
-                        else:
-                            return module(*inputs)
+            encoder_hidden_states, hidden_states = block(
+                hidden_states=hidden_states,
+                encoder_hidden_states=encoder_hidden_states,
+                temb=temb,
+                image_rotary_emb=image_rotary_emb,
+                joint_attention_kwargs=joint_attention_kwargs,
+            )
+            # print(encoder_hidden_states)
+            # save temp text embeddings
+            temp_embedding.append(encoder_hidden_states)
 
-                    return custom_forward
 
-                ckpt_kwargs: Dict[str, Any] = {"use_reentrant": False} if is_torch_version(">=", "1.11.0") else {}
-                encoder_hidden_states, hidden_states = torch.utils.checkpoint.checkpoint(
-                    create_custom_forward(block),
-                    hidden_states,
-                    encoder_hidden_states,
-                    temb,
-                    image_rotary_emb,
-                    **ckpt_kwargs,
-                )
-
-            else:
-                encoder_hidden_states, hidden_states = block(
-                    hidden_states=hidden_states,
-                    encoder_hidden_states=encoder_hidden_states,
-                    temb=temb,
-                    image_rotary_emb=image_rotary_emb,
-                    joint_attention_kwargs=joint_attention_kwargs,
-                )
 
             # controlnet residual
             if controlnet_block_samples is not None:
@@ -528,7 +518,7 @@ class FluxTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrig
         hidden_states = torch.cat([encoder_hidden_states, hidden_states], dim=1)
 
         for index_block, block in enumerate(self.single_transformer_blocks):
-            if torch.is_grad_enabled() and self.gradient_checkpointing:
+            if self.training and self.gradient_checkpointing:
 
                 def create_custom_forward(module, return_dict=None):
                     def custom_forward(*inputs):
@@ -575,6 +565,6 @@ class FluxTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrig
             unscale_lora_layers(self, lora_scale)
 
         if not return_dict:
-            return (output,)
+            return output,temp_embedding
 
         return Transformer2DModelOutput(sample=output)

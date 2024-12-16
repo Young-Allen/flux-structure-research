@@ -1,19 +1,24 @@
 import torch
-from diffusers import AutoPipelineForText2Image
-from safetensors.torch import load_file
+from diffusers import FluxPipeline
 
-# 加载基础模型管道
-flux_pipe = AutoPipelineForText2Image.from_pretrained("/mnt/d/studying-code/modelscope/FLUX.1-dev", torch_dtype=torch.bfloat16)
-flux_pipe.enable_sequential_cpu_offload()
+pipe = FluxPipeline.from_pretrained("/mnt/d/studying-code/modelscope/FLUX.1-dev", torch_dtype=torch.bfloat16)
+# pipe.enable_model_cpu_offload()
+pipe.enable_sequential_cpu_offload()
 
-prompt = ["A photo of a bunny"]
+prompt1 = ["A photo of a tiger"]
+prompt2 = ["A photo of a bunny"]
 
-image = pipe(
-    prompt,
+res = pipe(
+    prompt1,
     guidance_scale=0.0,
     num_inference_steps=4,
     max_sequence_length=256,
-    height=1024,
-    width=1024,
-    generator=torch.Generator("cpu").manual_seed(0)
-).images[0]
+    height=512,
+    width=512,
+    generator=torch.Generator("cpu").manual_seed(0),
+)
+
+image = res.images[0]
+
+# embedding_changes = res.embedding_changes
+# image.save("image.png")
